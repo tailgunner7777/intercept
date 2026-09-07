@@ -52,9 +52,35 @@ def _is_sdr_in_use() -> bool:
         import sys
 
         app_mod = sys.modules.get("app")
-        if app_mod and hasattr(app_mod, "get_sdr_device_status"):
-            if app_mod.get_sdr_device_status():
+        if app_mod:
+            if hasattr(app_mod, "get_sdr_device_status") and app_mod.get_sdr_device_status():
                 return True
+            for attr in [
+                "sensor_process",
+                "current_process",
+                "adsb_process",
+                "rtlamr_process",
+                "ais_process",
+                "acars_process",
+                "vdl2_process",
+                "aprs_process",
+                "radiosonde_process",
+                "morse_process",
+            ]:
+                p = getattr(app_mod, attr, None)
+                if p is not None and (p.poll() is None if hasattr(p, "poll") else True):
+                    return True
+
+        # Check companion processes (e.g. rtl_tcp in rtlamr, audio streaming in listening post)
+        rtlamr_mod = sys.modules.get("routes.rtlamr")
+        if rtlamr_mod and getattr(rtlamr_mod, "rtl_tcp_process", None):
+            p = rtlamr_mod.rtl_tcp_process
+            if p is not None and p.poll() is None:
+                return True
+
+        lp_mod = sys.modules.get("routes.listening_post")
+        if lp_mod and getattr(lp_mod, "audio_running", False):
+            return True
     except Exception:
         pass
     return _hackrf_probe_blocked()
@@ -152,23 +178,25 @@ def detect_rtlsdr_devices() -> list[SDRDevice]:
             env=env,
         )
         try:
-            stdout, stderr = proc.communicate(timeout=5)
-        except subprocess.TimeoutExpired:
-            logger.warning("rtl_test timed out after 5s; stopping gracefully")
+            # rtl_test prints device list immediately on startup, then continues
+            # its tuner benchmark indefinitely. Give it 0.3s to emit the device
+            # list, then send SIGINT to cleanly exit without blocking or stalling USB.
+            time.sleep(0.3)
             with contextlib.suppress(OSError):
                 proc.send_signal(signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=1.0)
+            output = (stderr or "") + (stdout or "")
+        except subprocess.TimeoutExpired:
+            logger.warning("rtl_test timed out; stopping gracefully")
+            with contextlib.suppress(OSError):
+                proc.terminate()
             try:
-                stdout, stderr = proc.communicate(timeout=1.5)
+                stdout, stderr = proc.communicate(timeout=0.5)
             except subprocess.TimeoutExpired:
                 with contextlib.suppress(OSError):
-                    proc.terminate()
-                try:
-                    stdout, stderr = proc.communicate(timeout=0.5)
-                except subprocess.TimeoutExpired:
-                    with contextlib.suppress(OSError):
-                        proc.kill()
-                    stdout, stderr = proc.communicate()
-        output = (stderr or "") + (stdout or "")
+                    proc.kill()
+                stdout, stderr = proc.communicate()
+            output = (stderr or "") + (stdout or "")
 
         # Parse device info from rtl_test output
         # Format: "0:  Realtek, RTL2838UHIDIR, SN: 00000001"
