@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import re
+import signal
 import subprocess
 import time
 
@@ -29,10 +30,10 @@ _HACKRF_CACHE_TTL_SECONDS = 3.0
 # both trigger it from DOMContentLoaded).  On a Pi the subprocess calls
 # (rtl_test, SoapySDRUtil, hackrf_info) each take seconds and block the
 # single gevent worker, serialising every other request behind them.
-# A short TTL cache avoids duplicate subprocess storms.
+# A cache avoids duplicate subprocess storms and prevents USB contention.
 _all_devices_cache: list[SDRDevice] = []
 _all_devices_cache_ts: float = 0.0
-_ALL_DEVICES_CACHE_TTL_SECONDS = 5.0
+_ALL_DEVICES_CACHE_TTL_SECONDS = 30.0
 
 
 def _hackrf_probe_blocked() -> bool:
@@ -43,6 +44,20 @@ def _hackrf_probe_blocked() -> bool:
         return get_subghz_manager().active_mode in {"rx", "decode", "tx", "sweep"}
     except Exception:
         return False
+
+
+def _is_sdr_in_use() -> bool:
+    """Return True when probing SDR devices would interfere with an active stream."""
+    try:
+        import sys
+
+        app_mod = sys.modules.get("app")
+        if app_mod and hasattr(app_mod, "get_sdr_device_status"):
+            if app_mod.get_sdr_device_status():
+                return True
+    except Exception:
+        pass
+    return _hackrf_probe_blocked()
 
 
 def _get_capabilities_for_type(sdr_type: SDRType) -> SDRCapabilities:
@@ -127,20 +142,33 @@ def detect_rtlsdr_devices() -> list[SDRDevice]:
             lib_paths = ["/usr/local/lib", "/opt/homebrew/lib"]
             current_ld = env.get("DYLD_LIBRARY_PATH", "")
             env["DYLD_LIBRARY_PATH"] = ":".join(lib_paths + [current_ld] if current_ld else lib_paths)
+        proc = subprocess.Popen(
+            [rtl_test_path, "-t"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
         try:
-            result = subprocess.run(
-                [rtl_test_path, "-t"],
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                timeout=5,
-                env=env,
-            )
+            stdout, stderr = proc.communicate(timeout=5)
         except subprocess.TimeoutExpired:
-            logger.warning("rtl_test timed out after 5s")
-            return []
-        output = result.stderr + result.stdout
+            logger.warning("rtl_test timed out after 5s; stopping gracefully")
+            with contextlib.suppress(OSError):
+                proc.send_signal(signal.SIGINT)
+            try:
+                stdout, stderr = proc.communicate(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    proc.terminate()
+                try:
+                    stdout, stderr = proc.communicate(timeout=0.5)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+                    stdout, stderr = proc.communicate()
+        output = (stderr or "") + (stdout or "")
 
         # Parse device info from rtl_test output
         # Format: "0:  Realtek, RTL2838UHIDIR, SN: 00000001"
@@ -257,7 +285,26 @@ def detect_soapy_devices(skip_types: set[SDRType] | None = None) -> list[SDRDevi
     try:
         # Use macOS-aware environment to find Homebrew-installed modules
         env = _get_soapy_env()
-        result = subprocess.run([soapy_cmd, "--find"], capture_output=True, text=True, timeout=10, env=env)
+        proc = subprocess.Popen(
+            [soapy_cmd, "--find"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env,
+        )
+        try:
+            stdout, _ = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning("SoapySDRUtil timed out; terminating gracefully")
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            try:
+                stdout, _ = proc.communicate(timeout=1.5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                stdout, _ = proc.communicate()
+        output = stdout or ""
 
         # Parse SoapySDR output
         # Format varies but typically includes lines like:
@@ -268,7 +315,7 @@ def detect_soapy_devices(skip_types: set[SDRType] | None = None) -> list[SDRDevi
         current_device: dict = {}
         device_counts: dict[SDRType, int] = {}
 
-        for line in result.stdout.split("\n"):
+        for line in output.split("\n"):
             line = line.strip()
 
             # Start of new device block
@@ -289,8 +336,6 @@ def detect_soapy_devices(skip_types: set[SDRType] | None = None) -> list[SDRDevi
         if current_device.get("driver"):
             _add_soapy_device(devices, current_device, device_counts, skip_types)
 
-    except subprocess.TimeoutExpired:
-        logger.warning("SoapySDRUtil timed out")
     except Exception as e:
         logger.debug(f"SoapySDR detection error: {e}")
 
@@ -500,9 +545,21 @@ def probe_rtlsdr_device(device_index: int) -> str | None:
                 # rtl_test exited with error and we never saw a success message
                 error_found = True
         finally:
-            with contextlib.suppress(OSError):
-                proc.kill()
-            proc.wait()
+            if proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    proc.send_signal(signal.SIGINT)
+                try:
+                    proc.wait(timeout=1.0)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError):
+                        proc.terminate()
+                    try:
+                        proc.wait(timeout=0.5)
+                    except subprocess.TimeoutExpired:
+                        with contextlib.suppress(OSError):
+                            proc.kill()
+                        with contextlib.suppress(Exception):
+                            proc.wait(timeout=0.5)
             if device_found:
                 # Allow the kernel to fully release the USB interface
                 # before the caller opens the device with dump1090/rtl_fm/etc.
@@ -525,9 +582,9 @@ def detect_all_devices(force: bool = False) -> list[SDRDevice]:
     """
     Detect all connected SDR devices across all supported hardware types.
 
-    Results are cached for a few seconds so that multiple callers hitting
-    this within the same page-load cycle (e.g. /devices + /adsb/tools) do
-    not each spawn a full set of blocking subprocess probes.
+    Results are cached to avoid duplicate subprocess storms.
+    If an SDR is actively in use, cached results are returned to prevent
+    hardware contention and streaming disruptions.
 
     Args:
         force: Bypass the cache and re-probe hardware.
@@ -537,7 +594,15 @@ def detect_all_devices(force: bool = False) -> list[SDRDevice]:
     global _all_devices_cache, _all_devices_cache_ts
 
     now = time.time()
-    if not force and _all_devices_cache_ts and (now - _all_devices_cache_ts) < _ALL_DEVICES_CACHE_TTL_SECONDS:
+    cache_valid = bool(_all_devices_cache and (now - _all_devices_cache_ts) < _ALL_DEVICES_CACHE_TTL_SECONDS)
+
+    # When an SDR device is actively in use or streaming, avoid re-probing hardware
+    # which can cause USB bus contention and crash active captures.
+    if _all_devices_cache and (_is_sdr_in_use() or (not force and cache_valid)):
+        logger.debug("Returning cached device list (%d device(s))", len(_all_devices_cache))
+        return list(_all_devices_cache)
+
+    if not force and cache_valid:
         logger.debug("Returning cached device list (%d device(s))", len(_all_devices_cache))
         return list(_all_devices_cache)
 
